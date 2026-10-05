@@ -6,6 +6,7 @@
 #
 # verify exits 0 on success, otherwise a bitmask:
 #   1=publish 2=live 4=resume 8=gone 16=tests 32=build 64=restart-durability
+#   128=aggregate-stream
 
 services:
   app:

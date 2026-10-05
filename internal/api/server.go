@@ -16,6 +16,9 @@ import (
 const (
 	// MaxBatchSize is the maximum number of events accepted by one POST.
 	MaxBatchSize = 50
+	// MaxStreamChannels is the maximum number of channels one aggregated
+	// stream may select.
+	MaxStreamChannels = 8
 	// HeartbeatInterval is the SSE idle comment interval (< 5s required).
 	HeartbeatInterval = 4 * time.Second
 )
@@ -38,6 +41,7 @@ func New(st *store.Store, _ Config) http.Handler {
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("POST /events/{channel}", s.handlePost)
 	mux.HandleFunc("GET /streams/{channel}", s.handleStream)
+	mux.HandleFunc("GET /streams", s.handleStreamMulti)
 	return withCommon(mux)
 }
 
@@ -251,6 +255,163 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-signal:
 			// A commit may have happened; loop and re-read.
+		case <-heartbeat.C:
+			// SSE comment line; keeps proxies from closing an idle stream.
+			_, _ = fmt.Fprintf(w, ": heartbeat %s\n\n", time.Now().UTC().Format(time.RFC3339))
+			flusher.Flush()
+		}
+	}
+}
+
+// channelBoundary locates one selected channel's retention window in an
+// aggregate 410 response, so the console can tell exactly which channels the
+// cursor fell behind and where each live window starts.
+type channelBoundary struct {
+	Channel           string `json:"channel"`
+	EarliestAvailable int64  `json:"earliestAvailableId"`
+	Expired           bool   `json:"expired"`
+}
+
+// multiGoneBody answers an expired aggregate resume cursor. Like the
+// single-channel 410 it is emitted before any SSE bytes; unlike it, the
+// boundary is broken down per selected channel (request order).
+type multiGoneBody struct {
+	Error    string            `json:"error"`
+	Channels []channelBoundary `json:"channels"`
+}
+
+func multiGoneBodyFor(channels []string, cursor int64, res store.MultiReadResult) multiGoneBody {
+	expired := make(map[string]bool, len(res.Expired))
+	quoted := make([]string, 0, len(res.Expired))
+	for _, name := range res.Expired {
+		expired[name] = true
+		quoted = append(quoted, strconv.Quote(name))
+	}
+	body := multiGoneBody{Channels: make([]channelBoundary, 0, len(channels))}
+	for _, name := range channels {
+		body.Channels = append(body.Channels, channelBoundary{
+			Channel:           name,
+			EarliestAvailable: res.Earliest[name],
+			Expired:           expired[name],
+		})
+	}
+	body.Error = fmt.Sprintf(
+		"Last-Event-ID %d fell behind the retention window of channel(s) %s: events newer than the cursor were trimmed; "+
+			"resync without Last-Event-ID to receive every retained event of the selected channels",
+		cursor, strings.Join(quoted, ", "))
+	return body
+}
+
+// parseStreamChannels validates the repeated ?channel= query parameters of
+// the aggregate stream: 1-8 non-empty, mutually distinct names. The set is
+// fixed for the lifetime of the connection.
+func parseStreamChannels(r *http.Request) ([]string, string) {
+	values, ok := r.URL.Query()["channel"]
+	if !ok || len(values) == 0 {
+		return nil, "at least one channel query parameter is required"
+	}
+	if len(values) > MaxStreamChannels {
+		return nil, fmt.Sprintf("at most %d channel query parameters are allowed, got %d",
+			MaxStreamChannels, len(values))
+	}
+	seen := make(map[string]bool, len(values))
+	channels := make([]string, 0, len(values))
+	for _, v := range values {
+		if strings.TrimSpace(v) == "" {
+			return nil, "channel names must not be empty"
+		}
+		if seen[v] {
+			return nil, fmt.Sprintf("channel %q is selected more than once", v)
+		}
+		seen[v] = true
+		channels = append(channels, v)
+	}
+	return channels, ""
+}
+
+// handleStreamMulti serves GET /streams?channel=a&channel=b... — the
+// aggregated stream the monitoring hall console uses to watch several
+// accelerator sections over one connection. Frames carry the same global id
+// and event fields as the single-channel stream plus the source channel, so
+// the console restores the cross-region interlock causality in one globally
+// ordered view with a single resume cursor.
+func (s *Server) handleStreamMulti(w http.ResponseWriter, r *http.Request) {
+	channels, errMsg := parseStreamChannels(r)
+	if errMsg != "" {
+		writeErr(w, http.StatusBadRequest, errMsg)
+		return
+	}
+
+	lastID, ok := parseLastEventID(r)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "Last-Event-ID must be a non-negative integer")
+		return
+	}
+
+	// Register on every selected channel BEFORE reading history: a publish
+	// landing anywhere around connection setup sets the signal and triggers
+	// another store read, so nothing in the gap is lost or delivered twice.
+	signal := s.hub.subscribeMany(channels)
+	defer s.hub.unsubscribeMany(channels, signal)
+
+	// Expired-cursor check must produce a real HTTP 410, which is only
+	// possible before the SSE response starts.
+	initial := s.store.ReadMultiHistory(channels, lastID)
+	if initial.Gone {
+		writeJSON(w, http.StatusGone, multiGoneBodyFor(channels, lastID, initial))
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache, must-revalidate")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, "retry: 3000\n\n")
+	flusher.Flush()
+
+	ctx := r.Context()
+	cursor := lastID
+
+	heartbeat := time.NewTicker(HeartbeatInterval)
+	defer heartbeat.Stop()
+
+	// Drain anything already pending on the signal so the first wait is
+	// driven only by commits that happen after the initial read.
+	select {
+	case <-signal:
+	default:
+	}
+
+	for {
+		// Re-read the merged history newer than the cursor. The store read is
+		// the single source of truth (one consistent cross-channel snapshot);
+		// the hub only wakes us.
+		res := s.store.ReadMultiHistory(channels, cursor)
+		if res.Gone {
+			writeSSEEvent(w, "error", 0, multiGoneBodyFor(channels, cursor, res))
+			flusher.Flush()
+			return
+		}
+		for _, e := range res.Events {
+			writeSSEEvent(w, "event", e.ID, e)
+			cursor = e.ID
+		}
+		if len(res.Events) > 0 {
+			flusher.Flush()
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-signal:
+			// A commit on any selected channel may have happened; re-read.
 		case <-heartbeat.C:
 			// SSE comment line; keeps proxies from closing an idle stream.
 			_, _ = fmt.Fprintf(w, ": heartbeat %s\n\n", time.Now().UTC().Format(time.RFC3339))

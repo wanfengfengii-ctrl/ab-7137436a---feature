@@ -221,6 +221,129 @@ func TestMixedReplayAndFreshInOneBatch(t *testing.T) {
 	}
 }
 
+func TestReadMultiHistoryMergesAndExpiresExactly(t *testing.T) {
+	s := mustOpen(t, 3) // retention 3 per channel
+
+	// Interleave global ids across channels.
+	for _, tc := range []struct {
+		ch  string
+		key string
+	}{
+		{"a", "a1"}, // id 1
+		{"b", "b1"}, // id 2
+		{"a", "a2"}, // id 3
+		{"b", "b2"}, // id 4
+		{"a", "a3"}, // id 5
+		{"a", "a4"}, // id 6 -> a trims id 1
+		{"a", "a5"}, // id 7 -> a trims id 3
+	} {
+		if _, err := s.Append(tc.ch, []Event{ev(tc.key, "info", "m")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// a: trimmed {1,3}, retained {5,6,7}; b: trimmed {}, retained {2,4}.
+
+	// No cursor: every retained event of the selected channels, id-ordered.
+	res := s.ReadMultiHistory([]string{"a", "b"}, 0)
+	if res.Gone {
+		t.Fatalf("no cursor must never be Gone: %+v", res)
+	}
+	var got []int64
+	for _, e := range res.Events {
+		got = append(got, e.ID)
+	}
+	want := []int64{2, 4, 5, 6, 7}
+	if len(got) != len(want) {
+		t.Fatalf("merged ids = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("merged ids = %v, want %v", got, want)
+		}
+	}
+	// Frames carry their source channel.
+	byID := map[int64]string{}
+	for _, e := range res.Events {
+		byID[e.ID] = e.Channel
+	}
+	if byID[2] != "b" || byID[4] != "b" || byID[5] != "a" || byID[6] != "a" || byID[7] != "a" {
+		t.Fatalf("channel tags wrong: %v", byID)
+	}
+
+	// Cursor 3 sits below b's earliest retained id (4) yet loses nothing:
+	// a's trimmed ids 1,3 are <= 3 and b trimmed nothing. Must NOT be Gone.
+	res = s.ReadMultiHistory([]string{"a", "b"}, 3)
+	if res.Gone {
+		t.Fatalf("cursor 3 loses nothing, must not be Gone: %+v", res)
+	}
+	if len(res.Events) != 4 || res.Events[0].ID != 4 || res.Events[3].ID != 7 {
+		t.Fatalf("cursor 3 events = %+v", res.Events)
+	}
+
+	// Cursor 2: a trimmed id 3 (> 2) which the console never saw -> Gone,
+	// pinpointing only channel a.
+	res = s.ReadMultiHistory([]string{"a", "b"}, 2)
+	if !res.Gone || len(res.Expired) != 1 || res.Expired[0] != "a" {
+		t.Fatalf("cursor 2: want Gone expired=[a], got %+v", res)
+	}
+	if res.Earliest["a"] != 5 || res.Earliest["b"] != 2 {
+		t.Fatalf("per-channel earliest wrong: %v", res.Earliest)
+	}
+
+	// Unselected channels contribute nothing.
+	res = s.ReadMultiHistory([]string{"b"}, 0)
+	if len(res.Events) != 2 || res.Events[0].Channel != "b" {
+		t.Fatalf("single selection leaked other channels: %+v", res.Events)
+	}
+
+	// Unknown/empty channels report earliest 0 and cannot expire a cursor.
+	res = s.ReadMultiHistory([]string{"never-seen"}, 99)
+	if res.Gone || res.Earliest["never-seen"] != 0 || len(res.Events) != 0 {
+		t.Fatalf("empty channel: %+v", res)
+	}
+}
+
+func TestMultiTrimBoundarySurvivesRestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+
+	s, err := Open(dir, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ ch, key string }{
+		{"x", "x1"}, // id 1
+		{"y", "y1"}, // id 2
+		{"x", "x2"}, // id 3
+		{"x", "x3"}, // id 4 -> x trims 1
+		{"x", "x4"}, // id 5 -> x trims 3
+	} {
+		if _, err := s.Append(tc.ch, []Event{ev(tc.key, "info", "m")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// x: trimmed {1,3}, retained {4,5}; y: retained {2}.
+	before := s.ReadMultiHistory([]string{"x", "y"}, 2)
+	if !before.Gone || len(before.Expired) != 1 || before.Expired[0] != "x" {
+		t.Fatalf("pre-restart: %+v", before)
+	}
+
+	s2, err := Open(dir, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := s2.ReadMultiHistory([]string{"x", "y"}, 2)
+	if !after.Gone || len(after.Expired) != 1 || after.Expired[0] != "x" {
+		t.Fatalf("post-restart expiry boundary changed: %+v", after)
+	}
+	if after.Earliest["x"] != before.Earliest["x"] || after.Earliest["y"] != before.Earliest["y"] {
+		t.Fatalf("earliest changed across restart: before=%v after=%v", before.Earliest, after.Earliest)
+	}
+	// And the boundary case stays lossless after restart too.
+	if res := s2.ReadMultiHistory([]string{"x", "y"}, 3); res.Gone {
+		t.Fatalf("post-restart cursor 3 must remain lossless: %+v", res)
+	}
+}
+
 func mustOpen(t *testing.T, retention int) *Store {
 	t.Helper()
 	s, err := Open(filepath.Join(t.TempDir(), "data"), retention)

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -33,6 +34,7 @@ type state struct {
 	Channel           string `json:"channel"`
 	AnchorKey         string `json:"anchorKey"`
 	Anchor            event  `json:"anchor"`
+	PreID             int64  `json:"preId"`
 	AnchorID          int64  `json:"anchorId"`
 	LastID            int64  `json:"lastId"`
 	EarliestAvailable int64  `json:"earliestAvailable"`
@@ -123,12 +125,90 @@ func streamStatus(base, ch string, lastID int64) (int, []byte) {
 	return resp.StatusCode, raw
 }
 
+// aggStreamStatus probes the aggregate multi-channel endpoint with a resume
+// cursor and returns the HTTP status plus (for non-200) the body.
+func aggStreamStatus(base string, channels []string, lastID int64) (int, []byte) {
+	q := make(url.Values)
+	for _, c := range channels {
+		q.Add("channel", c)
+	}
+	req, _ := http.NewRequest(http.MethodGet, base+"/streams?"+q.Encode(), nil)
+	req.Header.Set("Last-Event-ID", strconv.FormatInt(lastID, 10))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return -1, []byte(err.Error())
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		return http.StatusOK, nil
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, raw
+}
+
+// aggGoneBody mirrors the aggregate expired-cursor 410 response.
+type aggGoneBody struct {
+	Error    string `json:"error"`
+	Channels []struct {
+		Channel           string `json:"channel"`
+		EarliestAvailable int64  `json:"earliestAvailableId"`
+		Expired           bool   `json:"expired"`
+	} `json:"channels"`
+}
+
+// checkAggregateGone asserts that resuming the aggregate stream over
+// ch (plus an empty channel) from cursor fails with a 410 whose per-channel
+// boundaries pinpoint ch at the expected earliestAvailableId.
+func checkAggregateGone(base, ch string, cursor, wantEarliest int64) error {
+	unused := ch + "-unused"
+	code, raw := aggStreamStatus(base, []string{ch, unused}, cursor)
+	if code != http.StatusGone {
+		return fmt.Errorf("aggregate expired cursor: want 410, got %d: %s", code, raw)
+	}
+	var body aggGoneBody
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return fmt.Errorf("aggregate 410 body not JSON: %s", raw)
+	}
+	bounds := map[string]struct {
+		earliest int64
+		expired  bool
+	}{}
+	for _, b := range body.Channels {
+		bounds[b.Channel] = struct {
+			earliest int64
+			expired  bool
+		}{b.EarliestAvailable, b.Expired}
+	}
+	main, ok := bounds[ch]
+	if !ok || !main.expired || main.earliest != wantEarliest {
+		return fmt.Errorf("aggregate 410 boundary for %s: want expired earliestAvailableId=%d, body=%s",
+			ch, wantEarliest, raw)
+	}
+	empty, ok := bounds[unused]
+	if !ok || empty.expired || empty.earliest != 0 {
+		return fmt.Errorf("aggregate 410 boundary for empty channel %s wrong: %s", unused, raw)
+	}
+	return nil
+}
+
 func before(base, statePath string, retention int, channel string) error {
 	if channel == "" {
 		channel = fmt.Sprintf("restart-%d", time.Now().UnixNano())
 	}
 	st := state{Channel: channel, AnchorKey: "anchor"}
 	st.Anchor = mkEvent(st.AnchorKey, "critical", "permanent beam stop")
+
+	// A pre-anchor gives the console a resume cursor strictly below the
+	// anchor: once the anchor is trimmed, resuming from the pre-anchor is
+	// impossible without loss, which the aggregate stream must reject.
+	preID, replay, _, err := postOne(base, channel, mkEvent("pre-anchor", "info", "cursor position"))
+	if err != nil {
+		return fmt.Errorf("publish pre-anchor: %w", err)
+	}
+	if replay {
+		return fmt.Errorf("pre-anchor unexpectedly replayed")
+	}
+	st.PreID = preID
 
 	id, replay, _, err := postOne(base, channel, st.Anchor)
 	if err != nil {
@@ -165,6 +245,12 @@ func before(base, statePath string, retention int, channel string) error {
 	}
 	st.EarliestAvailable = gone.EarliestAvailable
 
+	// The aggregate stream must reject the same lossy resume with a 410
+	// whose per-channel boundary pinpoints this channel.
+	if err := checkAggregateGone(base, channel, st.PreID, st.EarliestAvailable); err != nil {
+		return err
+	}
+
 	b, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return err
@@ -172,8 +258,8 @@ func before(base, statePath string, retention int, channel string) error {
 	if err := os.WriteFile(statePath, b, 0o644); err != nil {
 		return err
 	}
-	fmt.Printf("recorded: channel=%s anchorID=%d lastID=%d earliestAvailable=%d\n",
-		st.Channel, st.AnchorID, st.LastID, st.EarliestAvailable)
+	fmt.Printf("recorded: channel=%s preID=%d anchorID=%d lastID=%d earliestAvailable=%d\n",
+		st.Channel, st.PreID, st.AnchorID, st.LastID, st.EarliestAvailable)
 	return nil
 }
 
@@ -222,6 +308,12 @@ func after(base, statePath string) error {
 	if gone.EarliestAvailable != st.EarliestAvailable {
 		return fmt.Errorf("earliestAvailableId changed across restart: before=%d after=%d",
 			st.EarliestAvailable, gone.EarliestAvailable)
+	}
+
+	// 3b. The aggregate stream's per-channel expiry boundary is likewise
+	// unchanged after the restart.
+	if err := checkAggregateGone(base, st.Channel, st.PreID, st.EarliestAvailable); err != nil {
+		return fmt.Errorf("after restart: %w", err)
 	}
 
 	// 4. Numbering continues strictly above every pre-restart id.

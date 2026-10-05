@@ -5,6 +5,12 @@ accelerator interlock console. After a network blip the console reconnects
 with `Last-Event-ID` and picks up **exactly where it left off** — it never
 misses a beam-stop signal, and it never re-displays history as new alarms.
 
+The monitoring hall can also watch several accelerator sections (linac,
+storage ring, …) over **one** connection: `GET /streams?channel=a&channel=b`
+merges every selected channel into a single stream ordered by the global id,
+so cross-region interlock causality is restored in true publish order without
+juggling per-channel reconnects.
+
 The service is a single static Go binary (standard library only) plus a
 multi-stage Dockerfile. No external datastores: state lives in local
 crash-safe WAL files rebuilt on startup.
@@ -17,8 +23,9 @@ crash-safe WAL files rebuilt on startup.
 | Idempotent ingestion | An event whose `eventKey` is already known **with identical content** replays the original result (same ids, `"replay": true`); no id is allocated and nothing is appended. |
 | Atomic conflict | If any event in a batch carries a known key with **different** content (or the same key appears twice in the batch with different content), the whole batch gets **HTTP 409 with zero writes**, with per-event pinpoint details. |
 | Gapless SSE resume | `GET /streams/{channel}` honors `Last-Event-ID`. History newer than the cursor is delivered first, then transitions seamlessly to live. Each event appears at most once, in id order. |
+| Aggregated stream | `GET /streams?channel=a&channel=b` (1–8 distinct channels) merges the selected channels into one id-ordered stream; every frame keeps the global id and original fields plus its source `channel`. One global resume cursor covers the whole selection; unselected channels never appear. |
 | Exactly-once under concurrency | The hub carries no payload — it only wakes connections; each stream re-reads the store from its own cursor. A wakeup coalescing or arriving out of order can neither lose nor duplicate an event. |
-| Retention / expired cursor | Each channel keeps the newest `RETENTION_LIMIT` readable events. A resume cursor older than the oldest retained id is answered **HTTP 410** with `earliestAvailableId`. |
+| Retention / expired cursor | Each channel keeps the newest `RETENTION_LIMIT` readable events. A resume cursor older than the oldest retained id is answered **HTTP 410** with `earliestAvailableId`. On the aggregate stream the 410 fires exactly when lossless resume is impossible — a selected channel trimmed events newer than the cursor — and pinpoints every channel's `earliestAvailableId`. |
 | Durability & restart | Committed batches are fsynced WAL files (temp + fsync + rename). After restart: global numbering, replay verdicts, conflict verdicts and the 410 boundary are unchanged; numbering continues above every id ever assigned. The durable WAL retains full history even though reads are retention-bounded. |
 | Heartbeat | An idle stream sends an SSE comment `: heartbeat …` every 4 s (< 5 s). |
 | Health | `GET /health` → 200 `{"status":"ok"}`; used by the container `HEALTHCHECK`. |
@@ -123,13 +130,67 @@ If retention crosses an open stream's cursor mid-connection, the stream ends
 with an `event: error` carrying the same `earliestAvailableId`, so the client
 resyncs.
 
+### `GET /streams?channel=a&channel=b` — aggregated SSE
+
+One connection watching **1–8** channels: repeat the `channel` query
+parameter for each section to observe. Names must be non-empty and mutually
+distinct (violations → 400); the selection is fixed for the lifetime of the
+connection.
+
+```
+GET /streams?channel=linac&channel=ring
+
+id: 42
+event: event
+data: {"id":42,"eventKey":"trip-linac-07","time":"…","severity":"critical","message":"…","channel":"linac"}
+
+id: 43
+event: event
+data: {"id":43,"eventKey":"orbit-warn","time":"…","severity":"warning","message":"…","channel":"ring"}
+```
+
+Every `event` frame keeps the **global** id and the original event fields and
+adds the source `channel`. Frames are emitted strictly in ascending id order
+(= global publish order) across the whole selection; events from unselected
+channels never appear. The heartbeat cadence is the same 4 s.
+
+Resume uses the same single global cursor: `Last-Event-ID: 42` (or
+`?lastEventId=`) delivers every retained event of the selected channels with
+id `> 42`; no cursor replays all retained events of the selection.
+
+**410 — lossless resume impossible** (sent before any SSE bytes):
+
+```json
+{
+  "error": "Last-Event-ID 5 fell behind the retention window of channel(s) \"linac\": events newer than the cursor were trimmed; resync without Last-Event-ID to receive every retained event of the selected channels",
+  "channels": [
+    {"channel": "linac", "earliestAvailableId": 18, "expired": true},
+    {"channel": "ring",  "earliestAvailableId": 30, "expired": false}
+  ]
+}
+```
+
+The aggregate 410 fires exactly when a selected channel **trimmed events
+newer than the cursor** — i.e. events the console never saw are gone and a
+lossless continuation is impossible. Because ids interleave globally, a
+merged cursor legitimately sits below another channel's first retained id
+without any loss; that alone never triggers a 410. `channels[]` lists every
+selected channel in request order with its live-window start
+(`earliestAvailableId`, `0` while the channel is empty) and an `expired`
+flag, so the console can locate exactly which sections overflowed. Dropping
+the cursor and reconnecting yields every still-retained event of the
+selection. If retention crosses the cursor mid-connection, the stream ends
+with an `event: error` carrying the same per-channel body.
+
 ## Console recovery in publish order
 
 Reconnecting with the last displayed global id restores, in id order
-(= publish order), every still-available critical/warning event; nothing
-older than `earliestAvailableId` can be sent (410 tells the console where the
-live window starts); any conflicting batch returns a locatable 409 and
-changes nothing.
+(= publish order), every still-available critical/warning event — on one
+channel via `GET /streams/{channel}`, or across the whole monitored selection
+via `GET /streams?channel=…` with the same single cursor. Nothing older than
+`earliestAvailableId` can be sent (the 410 tells the console where each live
+window starts, per channel); any conflicting batch returns a locatable 409
+and changes nothing.
 
 ## Run with Docker
 
@@ -143,13 +204,17 @@ curl -s -XPOST localhost:8080/events/linac -H 'content-type: application/json' \
 
 # Stream (Ctrl-C to stop)
 curl -N localhost:8080/streams/linac
+
+# Or watch several sections over one connection
+curl -N "localhost:8080/streams?channel=linac&channel=ring"
 ```
 
 ## One-shot `verify`
 
 Waits for `/health`, then aggregates **code tests, builds, publish/replay/
-conflict, live SSE + heartbeat, resume, expired-cursor and real-restart
-durability** into one bitmask exit code (`0` = all pass):
+conflict, live SSE + heartbeat, resume, expired-cursor, the aggregated
+multi-channel stream and real-restart durability** into one bitmask exit code
+(`0` = all pass):
 
 | bit | section |
 |---|---|
@@ -160,6 +225,7 @@ durability** into one bitmask exit code (`0` = all pass):
 | 16 | `go test ./...` |
 | 32 | build all binaries |
 | 64 | durability across an actual process restart |
+| 128 | aggregate stream: merged history, cross-channel live interleave, per-channel 410 + resync |
 
 ```bash
 make verify                       # native one-shot gate
@@ -177,7 +243,7 @@ make test
 
 ```
 cmd/server/         HTTP/SSE service entrypoint
-cmd/smoke/          one-shot e2e verifier (publish/live/resume/410)
+cmd/smoke/          one-shot e2e verifier (publish/live/resume/410/aggregate)
 cmd/restart-smoke/  two-phase durability verifier (before/after restart)
 cmd/healthcheck/    tiny static /health probe for distroless HEALTHCHECK
 internal/store/     append-only log: global ids, atomic append, WAL, retention
@@ -195,7 +261,17 @@ docker-compose.yml  app + one-shot verify service
 - **Wake-up-only hub.** SSE connections never receive data through the
   fan-out layer. They register, read history, then re-read everything with
   `id > cursor` whenever the hub signals. That removes the entire class of
-  registration-window races (lost/duplicated/reordered events).
+  registration-window races (lost/duplicated/reordered events). Aggregate
+  connections register one signal under every selected channel and merge
+  each re-read under the same store lock, so the cross-channel snapshot is
+  always consistent.
+- **Exact aggregate expiry boundary.** Trimming records the highest trimmed
+  id per channel. The aggregate 410 compares the resume cursor against that
+  boundary — lossless resume is impossible exactly when a selected channel
+  dropped events newer than the cursor — instead of against each channel's
+  earliest retained id, which would false-positive whenever global ids
+  interleave across channels. The boundary is recomputed during WAL replay,
+  so it is identical after a restart.
 - **Full-history WAL, bounded live window.** Trimming changes only what
   reads expose; the idempotency index is rebuilt from the complete WAL on
   boot, so aged-out keys keep the same replay/conflict verdict forever and

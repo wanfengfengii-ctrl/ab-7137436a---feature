@@ -42,6 +42,39 @@ func (h *hub) unsubscribe(channel string, ch chan struct{}) {
 	h.mu.Unlock()
 }
 
+// subscribeMany registers ONE wakeup signal under every given channel, so an
+// aggregate stream is woken by a commit on any of its selected channels. The
+// signal stays 1-buffered and coalescing: a burst of publishes across several
+// channels collapses into a single wake, and the subscriber re-reads the
+// merged history from its own cursor.
+func (h *hub) subscribeMany(channels []string) chan struct{} {
+	ch := make(chan struct{}, 1)
+	h.mu.Lock()
+	for _, name := range channels {
+		subs := h.channels[name]
+		if subs == nil {
+			subs = make(map[chan struct{}]struct{})
+			h.channels[name] = subs
+		}
+		subs[ch] = struct{}{}
+	}
+	h.mu.Unlock()
+	return ch
+}
+
+func (h *hub) unsubscribeMany(channels []string, ch chan struct{}) {
+	h.mu.Lock()
+	for _, name := range channels {
+		if subs, ok := h.channels[name]; ok {
+			delete(subs, ch)
+			if len(subs) == 0 {
+				delete(h.channels, name)
+			}
+		}
+	}
+	h.mu.Unlock()
+}
+
 // publish must be called AFTER the store commit is durable. A non-blocking
 // send on a 1-buffered signal coalesces bursts and never stalls publishers;
 // subscribers always re-read everything newer than their cursor.

@@ -69,6 +69,12 @@ type channelState struct {
 	// rebuilt from the full WAL on restart, so replay/conflict conclusions
 	// survive both trimming and restarts.
 	byKey map[string]*StoredEvent
+	// maxTrimmed is the highest id ever trimmed from the retained window
+	// (0 = nothing trimmed). The aggregate stream uses it as the exact
+	// expiry boundary: a resume cursor below it means events the console
+	// never saw have aged out. Recomputed by trimLocked during WAL replay,
+	// so it is identical after a restart.
+	maxTrimmed int64
 }
 
 // Store is the set of all channel logs plus the global id counter.
@@ -265,6 +271,92 @@ func (s *Store) ReadHistory(channel string, afterID int64) ReadResult {
 	return res
 }
 
+// ChannelEvent is a StoredEvent tagged with the channel it was published on.
+// It is the frame payload of the aggregated multi-channel stream: the
+// original event fields plus the source channel.
+type ChannelEvent struct {
+	ID       int64  `json:"id"`
+	EventKey string `json:"eventKey"`
+	Time     string `json:"time"`
+	Severity string `json:"severity"`
+	Message  string `json:"message"`
+	Channel  string `json:"channel"`
+}
+
+// MultiReadResult is the aggregate counterpart of ReadResult: the merged,
+// id-ordered history across several channels plus the per-channel retention
+// boundaries needed to answer an expired cursor.
+type MultiReadResult struct {
+	Events   []ChannelEvent   // merged history after the cursor, in id order
+	Earliest map[string]int64 // per selected channel: oldest retained id (0 = channel empty)
+	Expired  []string         // channels that trimmed events newer than the cursor
+	Gone     bool             // lossless resume from the cursor is impossible
+}
+
+// ReadMultiHistory merges, under one lock, the retained events of every
+// listed channel that have id strictly greater than afterID into a single
+// id-ordered slice. Taking one consistent snapshot across all channels is
+// what lets the aggregate stream preserve the global publish order: ids are
+// allocated under this same lock, so the merged view can neither skip an
+// event nor interleave a half-committed batch.
+//
+// Expired-cursor rule (aggregate): resuming from afterID is lossless iff no
+// selected channel has trimmed an event newer than afterID — events at or
+// below the cursor were already seen by the console, and everything newer is
+// still retained. When a channel HAS trimmed beyond the cursor, Gone is set
+// and Expired names the offending channels (in the caller's channel order);
+// Earliest carries each selected channel's live-window start for the 410
+// body. This is deliberately NOT the single-channel rule (cursor older than
+// the earliest retained id): with globally interleaved ids a merged cursor
+// routinely sits below another channel's first retained id without anything
+// being lost, so the aggregate checks the exact trim boundary instead.
+func (s *Store) ReadMultiHistory(channels []string, afterID int64) MultiReadResult {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	res := MultiReadResult{Earliest: make(map[string]int64, len(channels))}
+	for _, name := range channels {
+		c, ok := s.channels[name]
+		if !ok || len(c.events) == 0 {
+			// A channel with no retained events never trimmed anything
+			// (retention >= 1 keeps at least one), so it cannot expire a
+			// cursor; it simply contributes nothing to the merge yet.
+			res.Earliest[name] = 0
+			continue
+		}
+		res.Earliest[name] = c.events[0].ID
+		if afterID > 0 && c.maxTrimmed > afterID {
+			res.Gone = true
+			res.Expired = append(res.Expired, name)
+		}
+	}
+	if res.Gone {
+		return res
+	}
+	for _, name := range channels {
+		c, ok := s.channels[name]
+		if !ok {
+			continue
+		}
+		for _, e := range c.events {
+			if e.ID > afterID {
+				res.Events = append(res.Events, ChannelEvent{
+					ID:       e.ID,
+					EventKey: e.EventKey,
+					Time:     e.Time,
+					Severity: e.Severity,
+					Message:  e.Message,
+					Channel:  name,
+				})
+			}
+		}
+	}
+	// Ids are globally unique, so sorting by id is a total order: the merged
+	// stream replays events exactly in commit/ack order across channels.
+	sort.Slice(res.Events, func(i, j int) bool { return res.Events[i].ID < res.Events[j].ID })
+	return res
+}
+
 // Snapshot returns a point-in-time copy of a channel's retained events.
 func (s *Store) Snapshot(channel string) []*StoredEvent {
 	s.mu.RLock()
@@ -300,7 +392,14 @@ func (s *Store) trimLocked(channel string) {
 	if len(c.events) <= s.retention {
 		return
 	}
-	c.events = append([]*StoredEvent(nil), c.events[len(c.events)-s.retention:]...)
+	drop := len(c.events) - s.retention
+	// Record the exact trim boundary for the aggregate stream's expired-
+	// cursor check. Trimming drops an id-ordered prefix, so the last dropped
+	// event carries the highest trimmed id.
+	if id := c.events[drop-1].ID; id > c.maxTrimmed {
+		c.maxTrimmed = id
+	}
+	c.events = append([]*StoredEvent(nil), c.events[drop:]...)
 }
 
 func eventsEqual(a, b Event) bool {

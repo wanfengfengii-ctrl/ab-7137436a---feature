@@ -1,0 +1,7 @@
+bin/
+.verify-data/
+*.log
+.git/
+.idea/
+.vscode/
+.DS_Store

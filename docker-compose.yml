@@ -1,0 +1,49 @@
+# Interlock event service — Docker Compose.
+#
+#   docker compose up -d app          # run the service
+#   docker compose run --rm verify    # one-shot gate: waits for health, then
+#                                     # builds, tests, smoke and restart checks
+#
+# verify exits 0 on success, otherwise a bitmask:
+#   1=publish 2=live 4=resume 8=gone 16=tests 32=build 64=restart-durability
+
+services:
+  app:
+    build:
+      context: .
+    image: interlock-events:dev
+    environment:
+      APP_PORT: "${APP_PORT:-8080}"
+      DATA_DIR: /data
+      RETENTION_LIMIT: "${RETENTION_LIMIT:-100}"
+      HEALTH_URL: "http://localhost:${APP_PORT:-8080}/health"
+    ports:
+      - "${APP_PORT:-8080}:${APP_PORT:-8080}"
+    volumes:
+      - interlock-data:/data
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 2s
+    restart: unless-stopped
+
+  verify:
+    build:
+      context: .
+      target: verify
+    image: interlock-events-verify:dev
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      # End-to-end smoke runs against the app container; the verifier also
+      # spawns its own short-lived server (same RETENTION_LIMIT) for the
+      # restart-durability phase, where it must control the storage.
+      BASE_URL: "http://app:${APP_PORT:-8080}"
+      RETENTION_LIMIT: "${RETENTION_LIMIT:-25}"
+    restart: "no"
+
+volumes:
+  interlock-data:

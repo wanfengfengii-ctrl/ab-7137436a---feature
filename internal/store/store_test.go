@@ -229,3 +229,201 @@ func mustOpen(t *testing.T, retention int) *Store {
 	}
 	return s
 }
+
+func TestReadHistoryManyFirstIDSurvivesRestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+
+	// First phase: linac starts at id 1 and is trimmed; ring starts later.
+	s, err := Open(dir, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append("linac", []Event{
+		ev("l1", "critical", "1"),
+		ev("l2", "info", "2"),
+		ev("l3", "info", "3"), // linac window trimmed to [2,3]
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append("ring", []Event{ev("r1", "info", "1")}); err != nil { // id 4
+		t.Fatal(err)
+	}
+
+	// Reopen: firstID must be rebuilt from the WAL and the aggregate verdict
+	// unchanged. Cursor 1 predates linac (expired) but not ring (first id 4).
+	s2, err := Open(dir, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := s2.ReadHistoryMany([]string{"linac", "ring"}, 1)
+	if res.Expired["linac"] != 2 {
+		t.Fatalf("after restart linac expired boundary = %+v, want 2", res.Expired)
+	}
+	if _, ringExpired := res.Expired["ring"]; ringExpired {
+		t.Fatalf("after restart ring (first id 4 > cursor 1) must not be expired: %+v", res.Expired)
+	}
+}
+
+func TestReadHistoryManyMergesInGlobalIDOrder(t *testing.T) {
+	s := mustOpen(t, 0)
+
+	// Interleave commits across three channels; global ids are allocated in
+	// commit order across all channels.
+	mustAppend := func(ch, key string) int64 {
+		r, err := s.Append(ch, []Event{ev(key, "info", key)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r[0].ID
+	}
+	idLinac1 := mustAppend("linac", "l1")
+	idRing1 := mustAppend("ring", "r1")
+	idRing2 := mustAppend("ring", "r2")
+	idBooster := mustAppend("booster", "b1")
+	idLinac2 := mustAppend("linac", "l2")
+
+	res := s.ReadHistoryMany([]string{"linac", "ring", "booster"}, 0)
+	if len(res.Expired) != 0 {
+		t.Fatalf("no retention, unexpected expired: %+v", res.Expired)
+	}
+	want := []struct {
+		id      int64
+		channel string
+	}{
+		{idLinac1, "linac"},
+		{idRing1, "ring"},
+		{idRing2, "ring"},
+		{idBooster, "booster"},
+		{idLinac2, "linac"},
+	}
+	if len(res.Events) != len(want) {
+		t.Fatalf("merged events = %d, want %d", len(res.Events), len(want))
+	}
+	var prev int64
+	for i, w := range want {
+		got := res.Events[i]
+		if got.Event.ID != w.id || got.Channel != w.channel {
+			t.Fatalf("merged[%d] = id %d channel %q, want id %d channel %q",
+				i, got.Event.ID, got.Channel, w.id, w.channel)
+		}
+		if got.Event.ID <= prev {
+			t.Fatalf("merge not strictly id-ordered at %d: %d after %d", i, got.Event.ID, prev)
+		}
+		prev = got.Event.ID
+	}
+	if len(res.EarliestAvailable) != 3 ||
+		res.EarliestAvailable["linac"] != idLinac1 ||
+		res.EarliestAvailable["ring"] != idRing1 ||
+		res.EarliestAvailable["booster"] != idBooster {
+		t.Fatalf("earliest boundaries = %+v", res.EarliestAvailable)
+	}
+}
+
+func TestReadHistoryManyCursorAndUnselectedChannels(t *testing.T) {
+	s := mustOpen(t, 0)
+	mustAppend := func(ch, key string) int64 {
+		r, err := s.Append(ch, []Event{ev(key, "info", key)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r[0].ID
+	}
+	l1 := mustAppend("linac", "l1")
+	mustAppend("unselected", "x") // global id 2 must never surface
+	r1 := mustAppend("ring", "r1")
+	l2 := mustAppend("linac", "l2")
+
+	// Resume strictly above l1: only ring r1 and linac l2 remain, in id order.
+	res := s.ReadHistoryMany([]string{"linac", "ring", "never-written"}, l1)
+	if len(res.Events) != 2 {
+		t.Fatalf("want 2 merged events above cursor, got %d", len(res.Events))
+	}
+	if res.Events[0].Channel != "ring" || res.Events[0].Event.ID != r1 {
+		t.Fatalf("first = %+v", res.Events[0])
+	}
+	if res.Events[1].Channel != "linac" || res.Events[1].Event.ID != l2 {
+		t.Fatalf("second = %+v", res.Events[1])
+	}
+	if _, ok := res.EarliestAvailable["never-written"]; ok {
+		t.Fatal("empty channel must not impose an earliest boundary")
+	}
+	for _, ce := range res.Events {
+		if ce.Channel == "unselected" {
+			t.Fatal("event from an unselected channel leaked into the merge")
+		}
+	}
+}
+
+func TestReadHistoryManyExpiredPerChannel(t *testing.T) {
+	// retention 3: aging one channel out must be reported per channel even when
+	// another selected channel is still fully servable.
+	s := mustOpen(t, 3)
+	mustAppend := func(ch, key string) int64 {
+		r, err := s.Append(ch, []Event{ev(key, "info", key)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r[0].ID
+	}
+	old := mustAppend("linac", "old")
+	mustAppend("ring", "r1") // global id 2; ring stays well inside its window
+	// Three unique linac fills: linac ends with ids [1,3,4,5], trimmed to the
+	// retention window [3,4,5], so the oldest retained id is 3.
+	for i := 0; i < 3; i++ {
+		mustAppend("linac", "fill-"+string(rune('a'+i)))
+	}
+
+	// Cursor 1: linac had id 1 which aged out (expired). Ring's FIRST event is
+	// id 2, i.e. it had nothing at/before the cursor — a later-starting channel
+	// must not make the aggregate resume "gone".
+	res := s.ReadHistoryMany([]string{"linac", "ring"}, old)
+	if len(res.Expired) != 1 {
+		t.Fatalf("want exactly one expired channel, got %+v", res.Expired)
+	}
+	if res.Expired["linac"] != 3 {
+		t.Fatalf("linac earliest = %d, want 3 (%+v)", res.Expired["linac"], res.Expired)
+	}
+	if _, ringExpired := res.Expired["ring"]; ringExpired {
+		t.Fatal("ring's first event is newer than the cursor; it must not be flagged expired")
+	}
+	// Despite linac being expired, the merged read still reflects the store
+	// state (the caller turns Expired into a 410 rather than using Events):
+	// ring id 2 then linac's retained 3,4,5, all strictly above the cursor.
+	wantMerged := []struct {
+		id      int64
+		channel string
+	}{
+		{2, "ring"}, {3, "linac"}, {4, "linac"}, {5, "linac"},
+	}
+	if len(res.Events) != len(wantMerged) {
+		t.Fatalf("merged above cursor = %+v", res.Events)
+	}
+	for i, w := range wantMerged {
+		if res.Events[i].Event.ID != w.id || res.Events[i].Channel != w.channel {
+			t.Fatalf("merged[%d] = id %d %q, want id %d %q",
+				i, res.Events[i].Event.ID, res.Events[i].Channel, w.id, w.channel)
+		}
+	}
+	// EarliestAvailable still covers every non-empty selected channel.
+	if res.EarliestAvailable["ring"] != 2 {
+		t.Fatalf("ring boundary = %+v", res.EarliestAvailable)
+	}
+
+	// A cursor at/after both windows' earliest id is servable.
+	okRes := s.ReadHistoryMany([]string{"linac", "ring"}, 3)
+	if len(okRes.Expired) != 0 {
+		t.Fatalf("in-window cursor must not expire: %+v", okRes.Expired)
+	}
+
+	// But a cursor that predates ring's first retained event WHILE ring had an
+	// event at/before it is genuinely expired: publish one more linac fill so
+	// ring's window starts after a cursor ring itself has already passed.
+	mustAppend("ring", "r-later") // id 6; ring window [2,6]
+	// Force ring's id 2 out of retention by adding two more ring events.
+	mustAppend("ring", "r-later2") // id 7
+	mustAppend("ring", "r-later3") // id 8 -> ring window [6,7,8], earliest 6
+	gone := s.ReadHistoryMany([]string{"linac", "ring"}, 3)
+	if gone.Expired["ring"] != 6 {
+		t.Fatalf("ring should be expired at cursor 3 with earliest 6, got %+v", gone.Expired)
+	}
+}

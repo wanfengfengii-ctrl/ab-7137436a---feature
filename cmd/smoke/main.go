@@ -1,11 +1,13 @@
 // Command smoke is the one-shot end-to-end verifier. It waits for the
-// service to become healthy, then exercises four sections and folds their
+// service to become healthy, then exercises five sections and folds their
 // results into a bitmask exit code:
 //
-//	1  publishing / idempotent replay / 409 zero-write
-//	2  SSE live delivery and idle heartbeat
-//	4  SSE resume with Last-Event-ID (exactly-once, gapless)
-//	8  expired cursor -> HTTP 410 with earliestAvailableId
+//	1    publishing / idempotent replay / 409 zero-write
+//	2    SSE live delivery and idle heartbeat
+//	4    SSE resume with Last-Event-ID (exactly-once, gapless)
+//	8    expired cursor -> HTTP 410 with earliestAvailableId
+//	128  aggregate GET /streams: merged history, cross-channel live
+//	     interleaving, one-cursor resume and per-channel expired cursor
 //
 // Build failures and `go test` are aggregated by the verify entrypoint
 // (bits 16 and 32 respectively).
@@ -20,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -27,12 +30,13 @@ import (
 )
 
 const (
-	bitPublish = 1
-	bitLive    = 2
-	bitResume  = 4
-	bitGone    = 8
-	bitTests   = 16
-	bitBuild   = 32
+	bitPublish   = 1
+	bitLive      = 2
+	bitResume    = 4
+	bitGone      = 8
+	bitTests     = 16
+	bitBuild     = 32
+	bitAggregate = 128
 )
 
 type event struct {
@@ -70,6 +74,7 @@ type sseEvent struct {
 
 func main() {
 	base := flag.String("base", envOr("BASE_URL", "http://localhost:8080"), "service base URL")
+	retention := flag.Int("retention", envInt("RETENTION_LIMIT", 25), "server RETENTION_LIMIT (events kept per channel)")
 	flag.Parse()
 
 	failed := 0
@@ -85,7 +90,7 @@ func main() {
 
 	if err := waitHealthy(*base, 60*time.Second); err != nil {
 		fmt.Printf("[FATAL] service never became healthy: %v\n", err)
-		os.Exit(bitBuild | bitPublish | bitLive | bitResume | bitGone)
+		os.Exit(bitBuild | bitPublish | bitLive | bitResume | bitGone | bitAggregate)
 	}
 	fmt.Println("service is healthy")
 
@@ -93,6 +98,9 @@ func main() {
 	run("SSE live delivery + heartbeat", bitLive, func() error { return checkLive(*base) })
 	run("SSE resume Last-Event-ID exactly-once", bitResume, func() error { return checkResume(*base) })
 	run("expired cursor -> 410", bitGone, func() error { return checkGone(*base) })
+	run("aggregate stream: history + interleaving + resume + 410", bitAggregate, func() error {
+		return checkAggregate(*base, *retention)
+	})
 
 	fmt.Println()
 	if failed != 0 {
@@ -106,6 +114,15 @@ func main() {
 func envOr(k, d string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
+	}
+	return d
+}
+
+func envInt(k string, d int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
 	return d
 }
@@ -428,11 +445,315 @@ func getStreamStatus(base, channel string, after int64) (int, conflictBody, []by
 	return resp.StatusCode, cb, raw
 }
 
-// openStream opens an SSE GET and returns a channel of dispatched frames.
-// after==0 omits Last-Event-ID entirely. A non-200 status (e.g. 410) is
-// returned as an error containing the response body.
+// aggGoneBody is the aggregate 410 envelope with per-channel boundaries.
+type aggGoneBody struct {
+	Error             string           `json:"error"`
+	EarliestAvailable map[string]int64 `json:"earliestAvailableId"`
+}
+
+// aggFrameData is the JSON payload carried by an aggregate event frame.
+type aggFrameData struct {
+	ID       int64  `json:"id"`
+	Channel  string `json:"channel"`
+	EventKey string `json:"eventKey"`
+}
+
+// getAggregateStatus probes GET /streams?channel=... with a cursor and returns
+// the status plus any per-channel 410 boundaries, without consuming the live
+// body on 200.
+func getAggregateStatus(base string, channels []string, after int64) (int, aggGoneBody, []byte) {
+	q := url.Values{}
+	for _, c := range channels {
+		q.Add("channel", c)
+	}
+	req, _ := http.NewRequest(http.MethodGet, base+"/streams?"+q.Encode(), nil)
+	if after > 0 {
+		req.Header.Set("Last-Event-ID", strconv.FormatInt(after, 10))
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return -1, aggGoneBody{}, []byte(err.Error())
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		return http.StatusOK, aggGoneBody{}, nil
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	var b aggGoneBody
+	_ = json.Unmarshal(raw, &b)
+	return resp.StatusCode, b, raw
+}
+
+// checkAggregate exercises the aggregate event stream end to end:
+//   - validation (no / empty / duplicate / 9 channels -> 400);
+//   - retained history from multiple channels delivered in global id order
+//     with a channel field and no event from an unselected channel;
+//   - cross-channel live interleaving, then resume across a disconnect with a
+//     single global Last-Event-ID (gapless, exactly-once, channel-tagged);
+//   - an expired cursor answered 410 with locatable per-channel boundaries
+//     (only the genuinely aged-out channel), after which a cursorless
+//     reconnect yields exactly every still-retained selected-channel event.
+func checkAggregate(base string, retention int) error {
+	suffix := time.Now().UnixNano()
+	linac := fmt.Sprintf("agg-linac-%d", suffix)
+	ring := fmt.Sprintf("agg-ring-%d", suffix)
+	ignored := fmt.Sprintf("agg-ignored-%d", suffix)
+	watched := []string{linac, ring}
+
+	// --- validation -----------------------------------------------------------
+	if code, _, raw := getAggregateStatus(base, nil, 0); code != http.StatusBadRequest {
+		return fmt.Errorf("aggregate without channels: want 400, got %d %s", code, raw)
+	}
+	if code, _, raw := getAggregateStatus(base, []string{"", "b"}, 0); code != http.StatusBadRequest {
+		return fmt.Errorf("aggregate empty channel: want 400, got %d %s", code, raw)
+	}
+	if code, _, raw := getAggregateStatus(base, []string{"x", "x"}, 0); code != http.StatusBadRequest {
+		return fmt.Errorf("aggregate duplicate channel: want 400, got %d %s", code, raw)
+	}
+	nine := make([]string, 9)
+	for i := range nine {
+		nine[i] = fmt.Sprintf("c%d", i)
+	}
+	if code, _, raw := getAggregateStatus(base, nine, 0); code != http.StatusBadRequest {
+		return fmt.Errorf("aggregate 9 channels: want 400, got %d %s", code, raw)
+	}
+
+	// --- setup: interleaved history on watched + unselected channels ----------
+	published := map[string][]int64{}
+	pubID := func(ch, key string) (int64, error) {
+		code, pr, _, raw := postEvents(base, ch, []event{mkEvent(key, "critical", key)})
+		if code != http.StatusOK {
+			return 0, fmt.Errorf("publish %s/%s: %d %s", ch, key, code, raw)
+		}
+		id := pr.Results[0].ID
+		published[ch] = append(published[ch], id)
+		return id, nil
+	}
+	// setupErr short-circuits the one-shot setup: a publish failure aborts the
+	// check rather than panicking the whole verifier.
+	var setupErr error
+	mustPub := func(ch, key string) int64 {
+		if setupErr != nil {
+			return 0
+		}
+		id, err := pubID(ch, key)
+		if err != nil {
+			setupErr = err
+			return 0
+		}
+		return id
+	}
+	type idch struct {
+		id      int64
+		channel string
+	}
+	history := []idch{
+		{mustPub(linac, "h-l-1"), linac},
+		{mustPub(ring, "h-r-1"), ring},
+		{mustPub(ring, "h-r-2"), ring},
+		{mustPub(linac, "h-l-2"), linac},
+	}
+	if _, err := pubID(ignored, "h-x-1"); err != nil {
+		return err
+	}
+	if setupErr != nil {
+		return setupErr
+	}
+
+	// Read frames in the exact expected id order; heartbeat comments are
+	// skipped. A closed channel or a wrong id/channel/order fails the check.
+	expectOrder := func(frames <-chan sseEvent, want []idch, label string) (int64, error) {
+		var cursor int64
+		for _, w := range want {
+			for {
+				f, ok := <-frames
+				if !ok {
+					return cursor, fmt.Errorf("%s: stream closed waiting for id %d", label, w.id)
+				}
+				if f.Comment {
+					continue
+				}
+				var d aggFrameData
+				if err := json.Unmarshal([]byte(f.Data), &d); err != nil {
+					return cursor, fmt.Errorf("%s: bad frame json: %w", label, err)
+				}
+				if f.ID != w.id || d.ID != w.id {
+					return cursor, fmt.Errorf("%s: id mismatch frame=%d data=%d want=%d", label, f.ID, d.ID, w.id)
+				}
+				if d.Channel != w.channel {
+					return cursor, fmt.Errorf("%s: id %d channel=%q want %q", label, w.id, d.Channel, w.channel)
+				}
+				if f.ID <= cursor {
+					return cursor, fmt.Errorf("%s: non-monotonic id %d after %d", label, f.ID, cursor)
+				}
+				cursor = f.ID
+				break
+			}
+		}
+		return cursor, nil
+	}
+
+	// --- history merged in global id order ------------------------------------
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	frames, err := openAggregateStream(ctx, base, watched, 0)
+	if err != nil {
+		cancel()
+		return err
+	}
+	if _, err := expectOrder(frames, history, "history"); err != nil {
+		cancel()
+		return err
+	}
+
+	// --- cross-channel live interleaving (with unselected noise) --------------
+	var liveSeq []idch
+	for i := 0; i < 4; i++ {
+		liveSeq = append(liveSeq, idch{mustPub(linac, fmt.Sprintf("l-l-%d", i)), linac})
+		liveSeq = append(liveSeq, idch{mustPub(ring, fmt.Sprintf("l-r-%d", i)), ring})
+		if _, err := pubID(ignored, fmt.Sprintf("l-x-%d", i)); err != nil {
+			cancel()
+			return err
+		}
+	}
+	if setupErr != nil {
+		cancel()
+		return setupErr
+	}
+	lastCursor, err := expectOrder(frames, liveSeq, "live interleave")
+	if err != nil {
+		cancel()
+		return err
+	}
+	cancel()
+
+	// --- resume across a disconnect with one global cursor --------------------
+	gap := []idch{
+		{mustPub(ring, "g-r-1"), ring},
+		{mustPub(linac, "g-l-1"), linac},
+		{mustPub(ring, "g-r-2"), ring},
+	}
+	if setupErr != nil {
+		return setupErr
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel2()
+	frames2, err := openAggregateStream(ctx2, base, watched, lastCursor)
+	if err != nil {
+		return err
+	}
+	if _, err := expectOrder(frames2, gap, "resume"); err != nil {
+		return err
+	}
+
+	// --- age linac past retention while ring stays inside its window ----------
+	// Cursor at linac's very first event: once linac trims it, only linac is
+	// expired. Ring's first event is newer than that cursor, so ring must not
+	// be reported expired even though its earliest id is larger.
+	anchorCursor := history[0].id
+	var gone aggGoneBody
+	deadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := pubID(linac, fmt.Sprintf("age-%d", time.Now().UnixNano())); err != nil {
+			return err
+		}
+		code, body, raw := getAggregateStatus(base, watched, anchorCursor)
+		switch code {
+		case http.StatusOK:
+			continue
+		case http.StatusGone:
+			gone = body
+			_ = raw
+		default:
+			return fmt.Errorf("unexpected aggregate probe status %d: %s", code, raw)
+		}
+
+		if b, flagged := gone.EarliestAvailable[ring]; flagged {
+			return fmt.Errorf("ring first event is newer than cursor; it must not be flagged expired, got ring=%d: %s", b, raw)
+		}
+		linacEarliest, ok := gone.EarliestAvailable[linac]
+		if !ok || linacEarliest <= anchorCursor {
+			return fmt.Errorf("410 must pinpoint aged-out linac with boundary > cursor: %s", raw)
+		}
+
+		// --- cursorless reconnect: exactly every still-retained event --------
+		expected := map[int64]string{}
+		for _, ch := range watched {
+			ids := published[ch]
+			if retention > 0 && len(ids) > retention {
+				ids = ids[len(ids)-retention:]
+			}
+			for _, id := range ids {
+				expected[id] = ch
+			}
+		}
+		ctx3, cancel3 := context.WithTimeout(context.Background(), 10*time.Second)
+		frames3, err := openAggregateStream(ctx3, base, watched, 0)
+		if err != nil {
+			cancel3()
+			return fmt.Errorf("cursorless resync: %w", err)
+		}
+		got := make(map[int64]string, len(expected))
+		var prev int64
+		for len(got) < len(expected) {
+			select {
+			case f, ok := <-frames3:
+				if !ok {
+					cancel3()
+					return fmt.Errorf("resync stream closed early, got %d/%d", len(got), len(expected))
+				}
+				if f.Comment {
+					continue
+				}
+				var d aggFrameData
+				if err := json.Unmarshal([]byte(f.Data), &d); err != nil {
+					cancel3()
+					return fmt.Errorf("resync bad json: %w", err)
+				}
+				if f.ID <= prev {
+					cancel3()
+					return fmt.Errorf("resync non-monotonic: %d after %d", f.ID, prev)
+				}
+				wantCh, isExpected := expected[f.ID]
+				if !isExpected {
+					cancel3()
+					return fmt.Errorf("resync delivered unexpected/aged id %d from %q (anchor %d must be gone)",
+						f.ID, d.Channel, anchorCursor)
+				}
+				if d.Channel != wantCh {
+					cancel3()
+					return fmt.Errorf("resync id %d tagged %q, want %q", f.ID, d.Channel, wantCh)
+				}
+				prev = f.ID
+				got[f.ID] = d.Channel
+			case <-time.After(6 * time.Second):
+				cancel3()
+				return fmt.Errorf("resync timeout, got %d/%d retained events", len(got), len(expected))
+			}
+		}
+		cancel3()
+		return nil
+	}
+	return fmt.Errorf("retention boundary never reached on aggregate probe")
+}
+
+// openStream opens a single-channel SSE GET and returns a channel of
+// dispatched frames. after==0 omits Last-Event-ID entirely.
 func openStream(ctx context.Context, base, channel string, after int64) (<-chan sseEvent, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/streams/"+channel, nil)
+	return openStreamRaw(ctx, base, "/streams/"+channel, after)
+}
+
+// openAggregateStream opens GET /streams with one repeated channel query
+// parameter per watched channel.
+func openAggregateStream(ctx context.Context, base string, channels []string, after int64) (<-chan sseEvent, error) {
+	q := url.Values{}
+	for _, c := range channels {
+		q.Add("channel", c)
+	}
+	return openStreamRaw(ctx, base, "/streams?"+q.Encode(), after)
+}
+
+func openStreamRaw(ctx context.Context, base, rawPath string, after int64) (<-chan sseEvent, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+rawPath, nil)
 	if err != nil {
 		return nil, err
 	}

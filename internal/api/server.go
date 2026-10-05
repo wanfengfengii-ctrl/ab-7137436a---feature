@@ -16,6 +16,9 @@ import (
 const (
 	// MaxBatchSize is the maximum number of events accepted by one POST.
 	MaxBatchSize = 50
+	// MaxAggregateChannels is the maximum number of channels one aggregate
+	// GET /streams connection may watch.
+	MaxAggregateChannels = 8
 	// HeartbeatInterval is the SSE idle comment interval (< 5s required).
 	HeartbeatInterval = 4 * time.Second
 )
@@ -37,6 +40,7 @@ func New(st *store.Store, _ Config) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("POST /events/{channel}", s.handlePost)
+	mux.HandleFunc("GET /streams", s.handleAggregateStream)
 	mux.HandleFunc("GET /streams/{channel}", s.handleStream)
 	return withCommon(mux)
 }
@@ -253,6 +257,159 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// A commit may have happened; loop and re-read.
 		case <-heartbeat.C:
 			// SSE comment line; keeps proxies from closing an idle stream.
+			_, _ = fmt.Fprintf(w, ": heartbeat %s\n\n", time.Now().UTC().Format(time.RFC3339))
+			flusher.Flush()
+		}
+	}
+}
+
+// streamEvent is the JSON payload of an SSE event frame. For single-channel
+// streams Channel is left empty so the body stays identical to the original
+// per-channel wire shape; aggregate frames always carry the source channel.
+type streamEvent struct {
+	ID       int64  `json:"id"`
+	Channel  string `json:"channel,omitempty"`
+	EventKey string `json:"eventKey"`
+	Time     string `json:"time"`
+	Severity string `json:"severity"`
+	Message  string `json:"message"`
+}
+
+// aggregateGoneBody answers an aggregate resume cursor that has aged out of at
+// least one selected channel's retention window. EarliestAvailable is keyed by
+// channel so the caller can locate exactly which boundary blocks a loss-less
+// resume and can reconnect without a cursor to refetch every retained event.
+type aggregateGoneBody struct {
+	Error             string           `json:"error"`
+	EarliestAvailable map[string]int64 `json:"earliestAvailableId"`
+}
+
+// parseChannels validates the repeated channel query parameters: 1..8
+// non-empty, pairwise distinct values, returned in request order.
+func parseChannels(r *http.Request) ([]string, error) {
+	values, ok := r.URL.Query()["channel"]
+	if !ok || len(values) == 0 {
+		return nil, errors.New("at least one channel query parameter is required (e.g. ?channel=linac)")
+	}
+	if len(values) > MaxAggregateChannels {
+		return nil, fmt.Errorf("at most %d channels may be watched on one connection, got %d",
+			MaxAggregateChannels, len(values))
+	}
+	channels := make([]string, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, v := range values {
+		name := strings.TrimSpace(v)
+		if name == "" {
+			return nil, errors.New("channel must not be empty")
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("channel %q is repeated; watched channels must be distinct", name)
+		}
+		seen[name] = true
+		channels = append(channels, name)
+	}
+	return channels, nil
+}
+
+// handleAggregateStream serves GET /streams?channel=a&channel=b... One fixed
+// set of 1..8 channels is merged in global id order over a single SSE
+// connection, so cross-region interlock causality is reconstructed in global
+// publish order.
+func (s *Server) handleAggregateStream(w http.ResponseWriter, r *http.Request) {
+	channels, err := parseChannels(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	lastID, ok := parseLastEventID(r)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "Last-Event-ID must be a non-negative integer")
+		return
+	}
+
+	// Register on every watched channel BEFORE reading history, mirroring the
+	// single-stream invariant: a commit landing during setup signals a re-read.
+	signal := s.hub.subscribeMany(channels)
+	defer s.hub.unsubscribeMany(channels, signal)
+
+	// The expired-cursor verdict is a real HTTP 410 and must be decided before
+	// any SSE byte is written. Snapshot all channels atomically under one
+	// store lock so the boundary cannot move between per-channel checks.
+	initial := s.store.ReadHistoryMany(channels, lastID)
+	if len(initial.Expired) > 0 {
+		writeJSON(w, http.StatusGone, aggregateGoneBody{
+			Error: fmt.Sprintf(
+				"Last-Event-ID %d is older than the retained window on %d selected channel(s); "+
+					"reconnect without a cursor to receive every still-available event",
+				lastID, len(initial.Expired)),
+			EarliestAvailable: initial.Expired,
+		})
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache, must-revalidate")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, "retry: 3000\n\n")
+	flusher.Flush()
+
+	ctx := r.Context()
+	cursor := lastID
+
+	heartbeat := time.NewTicker(HeartbeatInterval)
+	defer heartbeat.Stop()
+
+	select {
+	case <-signal:
+	default:
+	}
+
+	for {
+		// Re-read the merged view whenever any watched channel commits. The
+		// store is the single source of truth; the hub carries no payload.
+		res := s.store.ReadHistoryMany(channels, cursor)
+		if len(res.Expired) > 0 {
+			// Retention crossed the cursor mid-connection: stop with a
+			// locatable per-channel boundary so the console resyncs.
+			writeSSEEvent(w, "error", 0, aggregateGoneBody{
+				Error: fmt.Sprintf(
+					"cursor %d expired due to retention on %d selected channel(s); resync without a cursor",
+					cursor, len(res.Expired)),
+				EarliestAvailable: res.Expired,
+			})
+			flusher.Flush()
+			return
+		}
+		for _, ce := range res.Events {
+			writeSSEEvent(w, "event", ce.Event.ID, streamEvent{
+				ID:       ce.Event.ID,
+				Channel:  ce.Channel,
+				EventKey: ce.Event.EventKey,
+				Time:     ce.Event.Time,
+				Severity: ce.Event.Severity,
+				Message:  ce.Event.Message,
+			})
+			cursor = ce.Event.ID
+		}
+		if len(res.Events) > 0 {
+			flusher.Flush()
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-signal:
+			// A commit may have happened on one of the channels; loop and re-read.
+		case <-heartbeat.C:
 			_, _ = fmt.Fprintf(w, ": heartbeat %s\n\n", time.Now().UTC().Format(time.RFC3339))
 			flusher.Flush()
 		}

@@ -64,6 +64,13 @@ type AppendResult struct {
 
 type channelState struct {
 	events []*StoredEvent // retained window, ordered by id
+	// firstID is the id of the channel's first event EVER committed. Unlike
+	// the retained window it is never advanced by trimming, so after a restart
+	// it lets readers distinguish "the cursor predates an aged-out event on
+	// this channel" from "this channel simply had no event at/before the
+	// cursor" — the latter is the normal case on aggregate streams whenever a
+	// channel's first event is newer than the global cursor.
+	firstID int64
 	// byKey is the durable idempotency index covering EVERY key ever seen,
 	// including keys whose events have aged out of the retained window. It is
 	// rebuilt from the full WAL on restart, so replay/conflict conclusions
@@ -225,6 +232,12 @@ func (s *Store) Append(channel string, events []Event) ([]AppendResult, error) {
 		return nil, fmt.Errorf("persist batch: %w", err)
 	}
 
+	// Record the channel's first-ever event only once the append is durable;
+	// it never changes again (trimming does not advance it).
+	if c.firstID == 0 && len(committed) > 0 {
+		c.firstID = committed[0].ID
+	}
+
 	s.trimLocked(channel)
 	return results, nil
 }
@@ -263,6 +276,113 @@ func (s *Store) ReadHistory(channel string, afterID int64) ReadResult {
 		}
 	}
 	return res
+}
+
+// ChannelEvent pairs a retained event with the channel it was published on;
+// it is the unit of delivery for aggregate (multi-channel) streams.
+type ChannelEvent struct {
+	Channel string
+	Event   *StoredEvent
+}
+
+// MultiReadResult is the aggregate-stream analogue of ReadResult: events from
+// several selected channels merged in global id order, plus the per-channel
+// retention boundaries needed to build a locatable 410.
+type MultiReadResult struct {
+	// Events is the k-way merge (by global id) of every selected channel's
+	// retained events with id strictly greater than the cursor.
+	Events []ChannelEvent
+	// EarliestAvailable holds the oldest retained id of every non-empty
+	// selected channel (empty channels are omitted).
+	EarliestAvailable map[string]int64
+	// Expired lists the channels that make the resume un-loss-less-able:
+	// channels whose first-ever event is at/before the cursor but whose
+	// retained window has since moved past it (firstID <= afterID <
+	// EarliestAvailable). A channel whose first event is newer than the
+	// cursor is NOT included, since the client could never have held an
+	// event from it. Empty means the cursor is still servable.
+	Expired map[string]int64
+}
+
+// ReadHistoryMany returns, in global id order, all retained events with id
+// strictly greater than afterID across the given channels. All channels are
+// snapshotted under one read lock, so the merge is a consistent point-in-time
+// view even while batches commit concurrently.
+//
+// Expired lists every non-empty selected channel whose first-ever event is at
+// or before the cursor but whose retained window starts after it; the caller
+// must answer 410 instead of streaming. Empty (never written) channels and
+// channels whose first event is simply newer than the cursor impose no
+// boundary.
+func (s *Store) ReadHistoryMany(channels []string, afterID int64) MultiReadResult {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	res := MultiReadResult{
+		EarliestAvailable: make(map[string]int64),
+		Expired:           make(map[string]int64),
+	}
+
+	type head struct {
+		channel string
+		events  []*StoredEvent
+		idx     int
+	}
+	var heads []head
+	for _, name := range channels {
+		c, ok := s.channels[name]
+		if !ok || len(c.events) == 0 {
+			continue
+		}
+		earliest := c.events[0].ID
+		res.EarliestAvailable[name] = earliest
+		// A cursor is expired on this channel only when the channel already
+		// had an event at/before the cursor whose retention window has since
+		// moved past it. A channel whose very first event is newer than the
+		// cursor (firstID > afterID) has nothing the client could have missed,
+		// so its earliest must NOT count as expired — the common case for an
+		// aggregate stream when one watched channel starts later.
+		if afterID > 0 && c.firstID > 0 && c.firstID <= afterID && earliest > afterID {
+			res.Expired[name] = earliest
+		}
+		idx := 0
+		if afterID > 0 {
+			// Each per-channel slice is id-ordered; skip to the first id
+			// strictly greater than the cursor.
+			for idx < len(c.events) && c.events[idx].ID <= afterID {
+				idx++
+			}
+		}
+		// Copy the pointer window under the lock: a concurrent append/trim
+		// must not race with the merge reading this slice after unlock.
+		snap := make([]*StoredEvent, len(c.events))
+		copy(snap, c.events)
+		heads = append(heads, head{channel: name, events: snap, idx: idx})
+	}
+
+	// K-way merge picking the smallest next global id. Global ids are unique
+	// across channels, so the result is strictly gap-free in id order.
+	for {
+		pick := -1
+		for i := range heads {
+			if heads[i].idx >= len(heads[i].events) {
+				continue
+			}
+			if pick == -1 || heads[i].events[heads[i].idx].ID <
+				heads[pick].events[heads[pick].idx].ID {
+				pick = i
+			}
+		}
+		if pick == -1 {
+			return res
+		}
+		e := heads[pick].events[heads[pick].idx]
+		res.Events = append(res.Events, ChannelEvent{
+			Channel: heads[pick].channel,
+			Event:   cloneStored(e),
+		})
+		heads[pick].idx++
+	}
 }
 
 // Snapshot returns a point-in-time copy of a channel's retained events.
@@ -485,6 +605,11 @@ func (s *Store) replayFile(wf walFile) error {
 		}
 		c.events = append(c.events, stored)
 		c.byKey[pe.EventKey] = stored
+		// Files replay in seq order with events in commit order, so the first
+		// event seen for a channel is its first-ever event.
+		if c.firstID == 0 {
+			c.firstID = pe.ID
+		}
 		if pe.ID >= s.nextID {
 			s.nextID = pe.ID + 1
 		}

@@ -12,6 +12,8 @@
 #   16  `go test ./...`
 #   32  build of all binaries
 #   64  durability across a real process restart (ids/replay/conflict/410)
+#  128  aggregate GET /streams: merged history, cross-channel live
+#       interleaving, one-cursor resume and per-channel expired cursor
 #
 # Usage:
 #   scripts/verify.sh                # builds binaries, manages a local server
@@ -102,19 +104,19 @@ fi
 
 # ---- 3. bring up a server unless BASE_URL was provided ---------------------
 if [ -n "$BASE" ]; then
-  wait_healthy "$BASE/health" || exit $((CODE | 1 | 2 | 4 | 8))
+  wait_healthy "$BASE/health" || exit $((CODE | 1 | 2 | 4 | 8 | 128))
 else
-  start_server || exit $((CODE | 1 | 2 | 4 | 8))
+  start_server || exit $((CODE | 1 | 2 | 4 | 8 | 128))
   BASE="http://localhost:$PORT"
 fi
 
-# ---- 4. end-to-end smoke: publish / live / resume / expired cursor ---------
+# ---- 4. end-to-end smoke: publish / live / resume / expired cursor / agg ---
 log "running end-to-end smoke against $BASE"
-if "$BIN/smoke" -base "$BASE"; then
-  log "smoke passed (bits 1/2/4/8 clear)"
+if "$BIN/smoke" -base "$BASE" -retention "$RETENTION"; then
+  log "smoke passed (bits 1/2/4/8/128 clear)"
 else
   rc=$?
-  echo "SMOKE reported failing bits: $rc (1=publish 2=live 4=resume 8=gone)" >&2
+  echo "SMOKE reported failing bits: $rc (1=publish 2=live 4=resume 8=gone 128=aggregate)" >&2
   CODE=$((CODE | rc))
 fi
 
@@ -170,6 +172,6 @@ if [ "$CODE" -eq 0 ]; then
   echo "ALL VERIFICATIONS PASSED (exit 0)"
 else
   echo "VERIFICATION FAILED, aggregated exit code: $CODE"
-  echo "  bits: 1=publish 2=live 4=resume 8=gone 16=tests 32=build 64=restart"
+  echo "  bits: 1=publish 2=live 4=resume 8=gone 16=tests 32=build 64=restart 128=aggregate"
 fi
 exit "$CODE"
